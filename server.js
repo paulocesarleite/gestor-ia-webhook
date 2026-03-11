@@ -6,6 +6,8 @@ app.use(express.json());
 
 const VERIFY_TOKEN = "gestor_ia_verify";
 const ACCESS_TOKEN = process.env.WHATSAPP_TOKEN;
+
+// ⚠️ Use exatamente o phone_number_id que aparece no seu painel
 const PHONE_NUMBER_ID = "1032130426649107";
 
 app.get("/webhook", (req, res) => {
@@ -23,7 +25,6 @@ app.get("/webhook", (req, res) => {
 
 app.post("/webhook", async (req, res) => {
   try {
-
     const message = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
 
     if (!message) {
@@ -41,23 +42,20 @@ app.post("/webhook", async (req, res) => {
     );
 
   } catch (error) {
-    console.error("Erro ao processar mensagem:", error.response?.data || error);
+    console.error("Erro ao processar mensagem:", error.response?.data || error.message);
   }
 
   res.sendStatus(200);
 });
 
 async function sendMessage(to, text) {
-
   await axios.post(
-    `https://graph.facebook.com/v22.0/1032130426649107/messages`,
+    `https://graph.facebook.com/v22.0/${PHONE_NUMBER_ID}/messages`,
     {
       messaging_product: "whatsapp",
       to: to,
       type: "text",
-      text: {
-        body: text
-      }
+      text: { body: text }
     },
     {
       headers: {
@@ -66,7 +64,6 @@ async function sendMessage(to, text) {
       }
     }
   );
-
 }
 
 app.listen(3000, () => {
