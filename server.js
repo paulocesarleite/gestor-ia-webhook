@@ -6,6 +6,7 @@ app.use(express.json());
 
 const VERIFY_TOKEN = "gestor_ia_verify";
 const ACCESS_TOKEN = process.env.WHATSAPP_TOKEN;
+const PHONE_NUMBER_ID = "1032130426649107";
 
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
@@ -22,6 +23,7 @@ app.get("/webhook", (req, res) => {
 
 app.post("/webhook", async (req, res) => {
   try {
+
     const message = req.body.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
 
     if (!message) {
@@ -31,25 +33,31 @@ app.post("/webhook", async (req, res) => {
     const from = message.from;
     const text = message.text?.body;
 
-    console.log("Mensagem recebida:", text);
+    console.log("Mensagem recebida do WhatsApp:", text);
 
-    await sendMessage(from, `Recebi sua mensagem: "${text}". Em breve vou analisar e confirmar antes de registrar.`);
+    await sendMessage(
+      from,
+      `Recebi sua mensagem: "${text}". Em breve vou analisar e confirmar antes de registrar.`
+    );
 
   } catch (error) {
-    console.error(error);
+    console.error("Erro ao processar mensagem:", error.response?.data || error);
   }
 
   res.sendStatus(200);
 });
 
 async function sendMessage(to, text) {
+
   await axios.post(
-    `https://graph.facebook.com/v18.0/164100763459601/messages`,
+    `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
     {
       messaging_product: "whatsapp",
       to: to,
       type: "text",
-      text: { body: text }
+      text: {
+        body: text
+      }
     },
     {
       headers: {
@@ -58,6 +66,7 @@ async function sendMessage(to, text) {
       }
     }
   );
+
 }
 
 app.listen(3000, () => {
