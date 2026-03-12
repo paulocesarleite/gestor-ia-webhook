@@ -7,15 +7,14 @@ app.use(express.json());
 // ─── Configurações ────────────────────────────────────────────
 const VERIFY_TOKEN = "gestor_ia_verify";
 const ACCESS_TOKEN = process.env.WHATSAPP_TOKEN;
-const PHONE_NUMBER_ID = "1032130426649107";
+const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID || "1052225807965727";
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
-const DATABASE_URL = process.env.DATABASE_URL;
 const BOT_NAME = "Financeiro";
 
-// ─── Supabase REST API ────────────────────────────────────────
-// Extrair dados da DATABASE_URL para usar via REST
-const SUPABASE_URL = `https://grfgavzbhgkiijisuayi.supabase.co`;
-const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY || "";
+// ─── Supabase REST API (banco do Lovable) ─────────────────────
+// Banco unificado: qnqdwifhhumxafbwmwcr.supabase.co
+const SUPABASE_URL = process.env.LOVABLE_SUPABASE_URL || "https://qnqdwifhhumxafbwmwcr.supabase.co";
+const SUPABASE_KEY = process.env.LOVABLE_SUPABASE_KEY || "";
 
 async function dbQuery(table, method = "GET", body = null, filters = "") {
   try {
@@ -44,6 +43,62 @@ async function dbUpdate(table, filters, data) {
 
 async function dbSelect(table, filters = "") {
   return await dbQuery(table, "GET", null, filters);
+}
+
+// ─── Mapeamento de entidades (banco Lovable) ──────────────────
+// Banco do Lovable usa tabela `transactions` com campos diferentes
+// entity_id em vez de entidade (nome → UUID)
+const ENTITY_MAP = {
+  "Clínica João Pessoa": "126d72ea-deb9-4a96-9492-5efb58525fda",
+  "Clínica Patos":       "52dee059-de0c-4c62-90aa-f7599d4bc672",
+  "Milena":              "16431322-a9d8-4fa3-89d9-09e137873dc7",
+  "Paulo":               "3e1ea69e-2b9f-4159-8539-e16c59e2a21e",
+  "Família":             "e7d83ec7-6814-431b-98d8-b82ed8e8bf36",
+  "Conjunta":            "126d72ea-deb9-4a96-9492-5efb58525fda", // JP como default conjunta
+};
+
+const ENTITY_NAME_MAP = {
+  "126d72ea-deb9-4a96-9492-5efb58525fda": "Clínica João Pessoa",
+  "52dee059-de0c-4c62-90aa-f7599d4bc672": "Clínica Patos",
+  "16431322-a9d8-4fa3-89d9-09e137873dc7": "Milena",
+  "3e1ea69e-2b9f-4159-8539-e16c59e2a21e": "Paulo",
+  "e7d83ec7-6814-431b-98d8-b82ed8e8bf36": "Família",
+};
+
+// Perfil padrão para lançamentos via WhatsApp
+const WA_USER_PROFILE_ID = "18f7f11d-678d-4e21-b3d7-a65f2a59cacb";
+
+// Converte dados internos → formato da tabela transactions do Lovable
+function toSupabaseTransaction(dados, usuarioNome, entityId) {
+  const now = new Date().toISOString();
+  return {
+    type:             dados.tipo === "RECEITA" ? "receita" : "despesa",
+    entity_id:        entityId,
+    description:      dados.descricao,
+    value:            dados.valor,
+    nature:           dados.isPF ? "variavel" : "fixo",
+    due_date:         dados.vencimentoDate || null,
+    status:           dados.status === "PAGO" ? "confirmado" : "confirmado",
+    source:           "whatsapp",
+    created_by:       WA_USER_PROFILE_ID,
+    payment_method:   dados.metodoPagamento || null,
+    payment_notes:    dados.codigoBarras ? `Código de barras: ${dados.codigoBarras}` : null,
+  };
+}
+
+// Busca transações do Lovable e converte para formato interno
+function fromSupabaseTransaction(t) {
+  return {
+    id:         t.id,
+    tipo:       t.type === "receita" ? "RECEITA" : "DESPESA",
+    valor:      Number(t.value),
+    descricao:  t.description,
+    entidade:   ENTITY_NAME_MAP[t.entity_id] || t.entity_id,
+    status:     t.status === "confirmado" ? "CONFIRMADO" : t.status?.toUpperCase(),
+    vencimento_date: t.due_date,
+    created_at: t.created_at,
+    fornecedor: t.description,
+  };
 }
 
 // ─── Usuários ─────────────────────────────────────────────────
@@ -111,13 +166,13 @@ async function enviarRelatorioDiario() {
   const now = agora();
   const inicioDia = new Date(now); inicioDia.setHours(0,0,0,0);
 
-  const txs = await dbSelect("transacoes", `?created_at=gte.${inicioDia.toISOString()}&status=eq.CONFIRMADO`);
-  const lista = txs || [];
+  const txs = await dbSelect("transactions", `?created_at=gte.${inicioDia.toISOString()}&source=eq.whatsapp`) || [];
+  const lista = txs.map(fromSupabaseTransaction);
 
   const receitas = lista.filter(t => t.tipo === "RECEITA");
   const despesas = lista.filter(t => t.tipo === "DESPESA");
-  const totR = receitas.reduce((s, t) => s + Number(t.valor), 0);
-  const totD = despesas.reduce((s, t) => s + Number(t.valor), 0);
+  const totR = receitas.reduce((s, t) => s + t.valor, 0);
+  const totD = despesas.reduce((s, t) => s + t.valor, 0);
 
   const diaSemana = now.toLocaleDateString("pt-BR", { weekday: "long", day: "2-digit", month: "long" });
   let msg = `🤖 *Aqui é o ${BOT_NAME}*\n\n📊 *Relatório do Dia — ${diaSemana}*\n\n`;
@@ -145,7 +200,17 @@ async function enviarRelatorioDiario() {
 
 // ─── Lembretes de vencimento ──────────────────────────────────
 async function verificarVencimentos() {
-  const boletos = await dbSelect("boletos_pendentes", "?status=eq.PENDENTE") || [];
+  // Buscar transações pendentes com data de vencimento
+  const txs = await dbSelect("transactions", "?status=eq.pendente&due_date=not.is.null") || [];
+  const boletos = txs.map(t => ({
+    id: t.id,
+    descricao: t.description,
+    valor: Number(t.value),
+    entidade: ENTITY_NAME_MAP[t.entity_id] || t.entity_id,
+    vencimento_date: t.due_date,
+    status: "PENDENTE",
+  }));
+
   const ehSexta = isSexta();
 
   for (const bill of boletos) {
@@ -193,22 +258,30 @@ async function enviarBalancoPF() {
   for (const [phone, usuario] of Object.entries(USUARIOS)) {
     if (!usuario.pf) continue;
 
-    const gastos = await dbSelect("transacoes",
-      `?status=eq.CONFIRMADO&tipo=eq.DESPESA&is_pf=eq.true&created_at=gte.${inicioMes.toISOString()}`
-    ) || [];
+    // Buscar despesas PF (entidade Paulo, Milena ou Família)
+    const pfEntityIds = [
+      ENTITY_MAP[usuario.nome],
+      ENTITY_MAP["Família"],
+    ].filter(Boolean);
 
-    const meus = gastos.filter(t => t.entidade === "Família" || t.entidade === usuario.nome);
-    const totalMes = meus.reduce((s, t) => s + Number(t.valor), 0);
+    const allGastos = [];
+    for (const eid of pfEntityIds) {
+      const txs = await dbSelect("transactions",
+        `?type=eq.despesa&entity_id=eq.${eid}&created_at=gte.${inicioMes.toISOString()}`
+      ) || [];
+      allGastos.push(...txs.map(fromSupabaseTransaction));
+    }
 
+    const totalMes = allGastos.reduce((s, t) => s + t.valor, 0);
     const mes = now.toLocaleDateString("pt-BR", { month: "long", year: "numeric" });
     let msg = `🤖 *Aqui é o ${BOT_NAME}*\n\n💳 *Balanço Pessoal — ${usuario.nome}*\n📅 ${mes.charAt(0).toUpperCase() + mes.slice(1)}\n\n`;
 
     semanas.forEach((s, i) => {
-      const semGastos = meus.filter(t => {
+      const semGastos = allGastos.filter(t => {
         const d = new Date(t.created_at);
         return d >= s.inicio && d <= s.fim;
       });
-      const tot = semGastos.reduce((acc, t) => acc + Number(t.valor), 0);
+      const tot = semGastos.reduce((acc, t) => acc + t.valor, 0);
       const ini = s.inicio.toLocaleDateString("pt-BR", { day: "2-digit", month: "2-digit" });
       const fim = s.fim.toLocaleDateString("pt-BR", { day: "2-digit", month: "2-digit" });
 
@@ -217,7 +290,7 @@ async function enviarBalancoPF() {
         msg += `  Sem gastos\n`;
       } else {
         const cats = {};
-        semGastos.forEach(t => { cats[t.categoria || t.descricao] = (cats[t.categoria || t.descricao] || 0) + Number(t.valor); });
+        semGastos.forEach(t => { cats[t.descricao] = (cats[t.descricao] || 0) + t.valor; });
         Object.entries(cats).sort(([,a],[,b]) => b - a).forEach(([c, v]) => msg += `  • ${c}: ${fmt(v)}\n`);
         msg += `  *Subtotal: ${fmt(tot)}*\n`;
       }
@@ -228,7 +301,7 @@ async function enviarBalancoPF() {
 
     if (totalMes > 0) {
       const cats = {};
-      meus.forEach(t => { cats[t.categoria || t.descricao] = (cats[t.categoria || t.descricao] || 0) + Number(t.valor); });
+      allGastos.forEach(t => { cats[t.descricao] = (cats[t.descricao] || 0) + t.valor; });
       const top3 = Object.entries(cats).sort(([,a],[,b]) => b - a).slice(0, 3);
       msg += `\n\n🔝 *Maiores gastos:*\n`;
       top3.forEach(([c, v]) => msg += `  • ${c}: ${fmt(v)} (${((v/totalMes)*100).toFixed(0)}%)\n`);
@@ -330,10 +403,11 @@ async function tratarRespostaUsuario(from, usuario, session, text) {
       return;
     }
     const bill = opcoes[idx];
-    await dbUpdate("boletos_pendentes", `?id=eq.${bill.id}`, {
-      status: "PAGO", paid_at: new Date().toISOString(), paid_by: usuario.nome
+    // Dar baixa na tabela transactions do Lovable
+    await dbUpdate("transactions", `?id=eq.${bill.id}`, {
+      status: "confirmado",
+      payment_notes: `Pago em ${hoje()} por ${usuario.nome}`,
     });
-    await dbUpdate("transacoes", `?id=eq.${bill.transacao_id || bill.id}`, { status: "PAGO" });
     pendingSessions.delete(from);
     await sendMessage(from, `🤖 *${BOT_NAME}:*\n\n✅ *Baixa realizada!*\n\n📋 ${bill.descricao}\n💵 ${fmt(bill.valor)}\n🏥 ${bill.entidade}\n📅 Pago em: ${hoje()}\n👤 Por: ${usuario.nome}`);
     await notificarGestores(usuario, bill, bill.id);
@@ -442,11 +516,18 @@ async function tratarRespostaIA(from, usuario, parsed, rawMessage) {
 
 // ─── Tratar comprovante ───────────────────────────────────────
 async function tratarComprovante(from, usuario, parsed) {
-  const boletos = await dbSelect("boletos_pendentes", "?status=eq.PENDENTE") || [];
-  const candidatos = boletos.filter(b => {
+  const txs = await dbSelect("transactions", "?status=eq.pendente&due_date=not.is.null") || [];
+  const candidatos = txs.map(t => ({
+    id: t.id,
+    descricao: t.description,
+    valor: Number(t.value),
+    entidade: ENTITY_NAME_MAP[t.entity_id] || t.entity_id,
+    vencimento_date: t.due_date,
+    fornecedor: t.description,
+  })).filter(b => {
     const mesmoFornecedor = b.fornecedor?.toLowerCase().includes(parsed.fornecedor?.toLowerCase() || "") ||
       parsed.fornecedor?.toLowerCase().includes(b.fornecedor?.toLowerCase() || "");
-    const mesmoValor = Math.abs(Number(b.valor) - Number(parsed.valor)) < 1.0;
+    const mesmoValor = Math.abs(b.valor - Number(parsed.valor)) < 1.0;
     return mesmoFornecedor || mesmoValor;
   });
 
@@ -480,7 +561,6 @@ async function tratarComprovante(from, usuario, parsed) {
 async function executarLancamento(from, usuario, session) {
   pendingSessions.delete(from);
   const dados = session.dados;
-  const id = gerarId();
 
   // Parsear data de vencimento
   let vencimentoDate = null;
@@ -494,31 +574,20 @@ async function executarLancamento(from, usuario, session) {
       vencimentoDate = d.toISOString().split("T")[0];
     }
   }
+  dados.vencimentoDate = vencimentoDate;
 
-  const transacao = {
-    id, tipo: dados.tipo, tipo_label: dados.tipoLabel || dados.tipo,
-    valor: dados.valor, descricao: dados.descricao,
-    fornecedor: dados.fornecedor, entidade: dados.entidade,
-    vencimento: dados.vencimento, vencimento_date: vencimentoDate,
-    parcelas: dados.parcelas, valor_parcela: dados.valorParcela,
-    codigo_barras: dados.codigoBarras, categoria: dados.categoria,
-    is_pf: dados.isPF || false,
-    status: dados.status || "CONFIRMADO",
-    raw_message: dados.rawMessage,
-    created_by: usuario.nome, created_by_phone: from,
-  };
+  // Resolver entity_id do Lovable
+  const entityId = ENTITY_MAP[dados.entidade] || ENTITY_MAP["Clínica João Pessoa"];
 
-  await dbInsert("transacoes", transacao);
+  // Montar payload no formato da tabela transactions do Lovable
+  const payload = toSupabaseTransaction(dados, usuario.nome, entityId);
 
-  // Adicionar boleto pendente se for despesa futura
+  const resultado = await dbInsert("transactions", payload);
+  const id = resultado?.[0]?.id || gerarId();
+
+  // Se despesa com vencimento futuro → registrar também como pendente (status pendente)
   if (dados.tipo === "DESPESA" && vencimentoDate && dados.status !== "PAGO") {
-    await dbInsert("boletos_pendentes", {
-      id: `B-${id}`, descricao: dados.descricao, fornecedor: dados.fornecedor,
-      valor: dados.valor, entidade: dados.entidade,
-      vencimento_date: vencimentoDate, vencimento: dados.vencimento,
-      codigo_barras: dados.codigoBarras, status: "PENDENTE",
-      created_by: usuario.nome, transacao_id: id,
-    });
+    await dbUpdate("transactions", `?id=eq.${id}`, { status: "pendente" });
   }
 
   let msg = `🤖 *${BOT_NAME}:*\n\n✅ *Registrado!*\n\n🆔 \`${id}\`\n📋 ${dados.descricao}\n💵 ${fmt(dados.valor)}\n🏥 ${dados.entidade}\n📂 ${dados.tipoLabel || dados.tipo}`;
@@ -539,44 +608,46 @@ async function notificarGestores(usuario, dados, id) {
 
 // ─── Verificar duplicidade ────────────────────────────────────
 async function verificarDuplicidade(parsed, fromPhone) {
+  if (!parsed.fornecedor) return null;
   const seteDias = new Date();
   seteDias.setDate(seteDias.getDate() - 7);
-  const txs = await dbSelect("transacoes",
-    `?created_at=gte.${seteDias.toISOString()}&fornecedor=ilike.*${encodeURIComponent(parsed.fornecedor || "")}*`
+  const txs = await dbSelect("transactions",
+    `?created_at=gte.${seteDias.toISOString()}&source=eq.whatsapp`
   ) || [];
   return txs.find(t =>
-    Math.abs(Number(t.valor) - Number(parsed.valor)) < 0.01 &&
-    t.created_by_phone !== fromPhone
+    Math.abs(Number(t.value) - Number(parsed.valor)) < 0.01 &&
+    t.description?.toLowerCase().includes(parsed.fornecedor?.toLowerCase() || "")
   ) || null;
 }
 
 // ─── Resumo gestor ────────────────────────────────────────────
 async function sendResumoGestor(from) {
   const inicioMes = new Date(); inicioMes.setDate(1); inicioMes.setHours(0,0,0,0);
-  const txs = await dbSelect("transacoes", `?status=eq.CONFIRMADO&created_at=gte.${inicioMes.toISOString()}`) || [];
-  const boletos = await dbSelect("boletos_pendentes", "?status=eq.PENDENTE") || [];
+  const txs = await dbSelect("transactions", `?created_at=gte.${inicioMes.toISOString()}`) || [];
+  const pendentes = await dbSelect("transactions", "?status=eq.pendente&due_date=not.is.null") || [];
 
-  const receitas = txs.filter(t => t.tipo === "RECEITA").reduce((s, t) => s + Number(t.valor), 0);
-  const despesas = txs.filter(t => t.tipo === "DESPESA").reduce((s, t) => s + Number(t.valor), 0);
-  const totalPend = boletos.reduce((s, b) => s + Number(b.valor), 0);
+  const receitas = txs.filter(t => t.type === "receita").reduce((s, t) => s + Number(t.value), 0);
+  const despesas = txs.filter(t => t.type === "despesa").reduce((s, t) => s + Number(t.value), 0);
+  const totalPend = pendentes.reduce((s, b) => s + Number(b.value), 0);
 
   const mes = new Date().toLocaleDateString("pt-BR", { month: "long", year: "numeric" });
   let msg = `🤖 *${BOT_NAME}:*\n\n📊 *Resumo — ${mes.charAt(0).toUpperCase() + mes.slice(1)}*\n\n`;
   msg += `💰 Receitas: ${fmt(receitas)}\n💸 Despesas: ${fmt(despesas)}\n📈 Saldo: ${fmt(receitas - despesas)}\n`;
-  msg += `📝 Lançamentos: ${txs.length}\n\n⏳ *Boletos pendentes: ${boletos.length} (${fmt(totalPend)})*`;
+  msg += `📝 Lançamentos: ${txs.length}\n\n⏳ *Boletos pendentes: ${pendentes.length} (${fmt(totalPend)})*`;
   await sendMessage(from, msg);
 }
 
 // ─── Boletos pendentes ────────────────────────────────────────
 async function responderBoletos(from) {
-  const boletos = await dbSelect("boletos_pendentes", "?status=eq.PENDENTE&order=vencimento_date.asc&limit=10") || [];
-  if (!boletos.length) { await sendMessage(from, `🤖 *${BOT_NAME}:*\n\n📭 Nenhum boleto pendente.`); return; }
+  const txs = await dbSelect("transactions", "?status=eq.pendente&due_date=not.is.null&order=due_date.asc&limit=10") || [];
+  if (!txs.length) { await sendMessage(from, `🤖 *${BOT_NAME}:*\n\n📭 Nenhum boleto pendente.`); return; }
 
   let msg = `🤖 *${BOT_NAME}:*\n\n📋 *Boletos pendentes:*\n\n`;
-  boletos.forEach(b => {
-    const d = b.vencimento_date ? diasAteVencimento(b.vencimento_date) : "?";
+  txs.forEach(t => {
+    const d = t.due_date ? diasAteVencimento(t.due_date) : "?";
     const u = d === 0 ? "🔴" : d <= 3 ? "🟡" : "🟢";
-    msg += `${u} ${b.descricao} — ${fmt(b.valor)}\n📅 ${fmtDate(b.vencimento_date)} | ${b.entidade}\n\n`;
+    const entidade = ENTITY_NAME_MAP[t.entity_id] || "–";
+    msg += `${u} ${t.description} — ${fmt(t.value)}\n📅 ${fmtDate(t.due_date)} | ${entidade}\n\n`;
   });
   await sendMessage(from, msg);
 }
@@ -681,18 +752,18 @@ async function sendHelpMessage(from, usuario) {
 app.get("/api/dashboard", async (req, res) => {
   try {
     const inicioMes = new Date(); inicioMes.setDate(1); inicioMes.setHours(0,0,0,0);
-    const [txs, boletos] = await Promise.all([
-      dbSelect("transacoes", `?status=eq.CONFIRMADO&created_at=gte.${inicioMes.toISOString()}`),
-      dbSelect("boletos_pendentes", "?status=eq.PENDENTE"),
+    const [txs, pendentes] = await Promise.all([
+      dbSelect("transactions", `?created_at=gte.${inicioMes.toISOString()}`),
+      dbSelect("transactions", "?status=eq.pendente&due_date=not.is.null"),
     ]);
-    const lista = txs || []; const blist = boletos || [];
-    const receitas = lista.filter(t => t.tipo === "RECEITA").reduce((s, t) => s + Number(t.valor), 0);
-    const despesas = lista.filter(t => t.tipo === "DESPESA").reduce((s, t) => s + Number(t.valor), 0);
+    const lista = txs || []; const blist = pendentes || [];
+    const receitas = lista.filter(t => t.type === "receita").reduce((s, t) => s + Number(t.value), 0);
+    const despesas = lista.filter(t => t.type === "despesa").reduce((s, t) => s + Number(t.value), 0);
     res.json({
       totalReceitas: receitas, totalDespesas: despesas, saldo: receitas - despesas,
       totalLancamentos: lista.length, boletosPendentes: blist.length,
-      totalPendente: blist.reduce((s, b) => s + Number(b.valor), 0),
-      recentTransactions: lista.slice(-5).reverse(),
+      totalPendente: blist.reduce((s, b) => s + Number(b.value), 0),
+      recentTransactions: lista.slice(-5).reverse().map(fromSupabaseTransaction),
     });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
@@ -700,27 +771,28 @@ app.get("/api/dashboard", async (req, res) => {
 app.get("/api/transactions", async (req, res) => {
   const { entidade, tipo, status } = req.query;
   let filters = "?order=created_at.desc";
-  if (entidade) filters += `&entidade=eq.${entidade}`;
-  if (tipo) filters += `&tipo=eq.${tipo}`;
-  if (status) filters += `&status=eq.${status}`;
-  const data = await dbSelect("transacoes", filters);
-  res.json(data || []);
+  if (entidade && ENTITY_MAP[entidade]) filters += `&entity_id=eq.${ENTITY_MAP[entidade]}`;
+  if (tipo) filters += `&type=eq.${tipo.toLowerCase()}`;
+  if (status) filters += `&status=eq.${status.toLowerCase()}`;
+  const data = await dbSelect("transactions", filters);
+  res.json((data || []).map(fromSupabaseTransaction));
 });
 
 app.get("/api/bills", async (req, res) => {
-  const data = await dbSelect("boletos_pendentes", "?status=eq.PENDENTE&order=vencimento_date.asc");
-  res.json(data || []);
+  const data = await dbSelect("transactions", "?status=eq.pendente&due_date=not.is.null&order=due_date.asc");
+  res.json((data || []).map(fromSupabaseTransaction));
 });
 
 // ─── Health ───────────────────────────────────────────────────
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", version: "4.0", db: !!DATABASE_URL, timestamp: new Date().toISOString() });
+  res.json({ status: "ok", version: "5.0", db: SUPABASE_URL, timestamp: new Date().toISOString() });
 });
 
 // ─── Start ────────────────────────────────────────────────────
 app.listen(3000, () => {
-  console.log("🚀 Gestor IA WhatsApp v4 rodando na porta 3000");
+  console.log("🚀 Gestor IA WhatsApp v5 rodando na porta 3000");
   console.log(`🤖 IA: ${ANTHROPIC_API_KEY ? "configurada ✅" : "NÃO configurada ❌"}`);
   console.log(`📱 WhatsApp Token: ${ACCESS_TOKEN ? "configurado ✅" : "NÃO configurado ❌"}`);
-  console.log(`🗄️  Banco: ${DATABASE_URL ? "configurado ✅" : "NÃO configurado ❌"}`);
+  console.log(`🗄️  Banco Lovable: ${SUPABASE_URL}`);
+  console.log(`🔑 Supabase Key: ${SUPABASE_KEY ? "configurada ✅" : "NÃO configurada ❌"}`);
 });
