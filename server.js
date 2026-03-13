@@ -158,6 +158,8 @@ setInterval(async () => {
 
   if (hora === 18 && min === 0 && isDiaUtil(now)) await enviarRelatorioDiario();
   if (hora === 9  && min === 0 && isDiaUtil(now)) await verificarVencimentos();
+  if (hora === 9  && min === 0 && isDiaUtil(now)) await verificarFechamentoCartoes();
+  if (hora === 9  && min === 0 && isDiaUtil(now)) await verificarVencimentoCartoes();
   if (hora === 9  && min === 0 && isSegunda(now)) await enviarBalancoPF();
 }, 60000);
 
@@ -311,6 +313,233 @@ async function enviarBalancoPF() {
   }
 }
 
+// ─── FLUXO DE FATURA DE CARTÃO ────────────────────────────────
+
+// Verificar cartões com fechamento hoje e avisar no WhatsApp
+async function verificarFechamentoCartoes() {
+  const hoje = new Date();
+  const diaHoje = hoje.getDate();
+
+  const cartoes = await dbSelect("credit_cards", "?is_active=eq.true") || [];
+  const fechamHoje = cartoes.filter(c => c.closing_day === diaHoje || c.closing_day === String(diaHoje));
+
+  for (const cartao of fechamHoje) {
+    const entidade = ENTITY_NAME_MAP[cartao.entity_id] || "–";
+    const msg = `🤖 *${BOT_NAME}:*\n\n💳 *Fatura fechou hoje!*\n\n🏦 ${cartao.name}\n🏥 ${entidade}\n📅 Vencimento: dia ${cartao.due_day}\n\nMe envie o *PDF da fatura* aqui no WhatsApp que eu leio e lanço as despesas automaticamente.`;
+    for (const phone of GESTORES) await sendMessage(phone, msg);
+  }
+}
+
+// Verificar cartões com vencimento próximo e avisar
+async function verificarVencimentoCartoes() {
+  const hoje = new Date();
+  const diaHoje = hoje.getDate();
+
+  const cartoes = await dbSelect("credit_cards", "?is_active=eq.true") || [];
+
+  for (const cartao of cartoes) {
+    const dueDay = parseInt(cartao.due_day);
+    if (isNaN(dueDay)) continue;
+
+    // Calcular dias até vencimento
+    const vencimento = new Date(hoje.getFullYear(), hoje.getMonth(), dueDay);
+    if (vencimento < hoje) vencimento.setMonth(vencimento.getMonth() + 1);
+    const dias = Math.round((vencimento - hoje) / 86400000);
+
+    if (dias === 3 || dias === 1 || dias === 0) {
+      // Buscar fatura pendente deste cartão
+      const faturas = await dbSelect("card_invoice_items",
+        `?card_id=eq.${cartao.id}&status=eq.pendente&order=invoice_date.desc&limit=1`
+      ) || [];
+      const totalFatura = faturas.reduce((s, i) => s + Number(i.amount || 0), 0);
+
+      const entidade = ENTITY_NAME_MAP[cartao.entity_id] || "–";
+      const tipo = dias === 0 ? "vence *HOJE*" : `vence em *${dias} dia${dias > 1 ? "s" : ""}*`;
+      const msg = `🤖 *${BOT_NAME}:*\n\n⏰ *Vencimento de Cartão*\n\n💳 ${cartao.name}\n🏥 ${entidade}\n📅 Fatura ${tipo}${totalFatura > 0 ? `\n💵 Total: ${fmt(totalFatura)}` : ""}\n\nConfirme o pagamento no painel.`;
+      for (const phone of GESTORES) await sendMessage(phone, msg);
+    }
+  }
+}
+
+// Processar PDF de fatura de cartão
+async function processarFaturaCartao(from, usuario, message) {
+  await sendMessage(from, `🤖 _${BOT_NAME} lendo a fatura..._`);
+  try {
+    const mediaId = message.document?.id;
+    if (!mediaId) {
+      await sendMessage(from, `🤖 *${BOT_NAME}:* ⚠️ Não consegui ler o PDF. Tente novamente.`);
+      return;
+    }
+
+    // Baixar o PDF via API do WhatsApp
+    const mediaRes = await axios.get(`https://graph.facebook.com/v22.0/${mediaId}`, {
+      headers: { Authorization: `Bearer ${ACCESS_TOKEN}` }
+    });
+    const pdfRes = await axios.get(mediaRes.data.url, {
+      headers: { Authorization: `Bearer ${ACCESS_TOKEN}` },
+      responseType: "arraybuffer"
+    });
+    const base64 = Buffer.from(pdfRes.data).toString("base64");
+
+    // Buscar cartões cadastrados para identificar qual é
+    const cartoes = await dbSelect("credit_cards", "?is_active=eq.true") || [];
+    const listaCartoes = cartoes.map(c => `${c.name} (id: ${c.id})`).join(", ") || "nenhum cadastrado";
+
+    // IA lê o PDF e extrai os lançamentos
+    const response = await axios.post("https://api.anthropic.com/v1/messages", {
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 4000,
+      system: `Você é especialista em leitura de faturas de cartão de crédito brasileiras.
+Cartões cadastrados no sistema: ${listaCartoes}
+Entidades: Clínica João Pessoa, Clínica Patos, Conjunta, Paulo, Milena, Família
+
+Extraia TODOS os lançamentos da fatura. Para cada um, classifique:
+- type: "despesa"
+- entity: entidade mais provável (Paulo ou Milena para gastos pessoais, Família para casa, Conjunta para marketing/clínica)
+- category: categoria do gasto (alimentação, saúde, transporte, mercado, farmácia, vestuário, lazer, assinatura, combustível, outros)
+- is_pf: true se for gasto pessoal/familiar, false se for da clínica
+
+Responda APENAS JSON válido:
+{
+  "card_name": "nome do cartão identificado na fatura",
+  "card_id": "id do cartão se identificado ou null",
+  "invoice_month": "MM/YYYY",
+  "total": 0.00,
+  "due_date": "YYYY-MM-DD",
+  "items": [
+    {
+      "date": "DD/MM",
+      "description": "descrição original",
+      "amount": 0.00,
+      "entity": "Paulo",
+      "category": "alimentação",
+      "is_pf": true,
+      "type": "despesa"
+    }
+  ]
+}`,
+      messages: [{
+        role: "user",
+        content: [
+          { type: "document", source: { type: "base64", media_type: "application/pdf", data: base64 } },
+          { type: "text", text: `Extraia todos os lançamentos desta fatura. Data atual: ${hoje()}` }
+        ]
+      }]
+    }, {
+      headers: { "x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "Content-Type": "application/json" },
+      timeout: 60000
+    });
+
+    const raw = response.data.content[0].text.replace(/```json\n?|\n?```/g, "").trim();
+    const fatura = JSON.parse(raw);
+
+    if (!fatura.items || fatura.items.length === 0) {
+      await sendMessage(from, `🤖 *${BOT_NAME}:* ⚠️ Não encontrei lançamentos na fatura. Tente um PDF mais claro.`);
+      return;
+    }
+
+    // Salvar fatura pendente na sessão
+    const session = {
+      etapa: "REVISAR_FATURA",
+      fatura,
+      itemsConfirmados: fatura.items.map((item, i) => ({ ...item, idx: i, confirmado: true }))
+    };
+    pendingSessions.set(from, session);
+    setTimeout(() => pendingSessions.delete(from), 1800000); // 30 min para revisar
+
+    // Montar resumo para o usuário
+    const total = fatura.items.reduce((s, i) => s + Number(i.amount || i.value || 0), 0);
+    const porEntidade = {};
+    fatura.items.forEach(i => {
+      porEntidade[i.entity] = (porEntidade[i.entity] || 0) + Number(i.amount);
+    });
+
+    let msg = `🤖 *${BOT_NAME}:*\n\n💳 *Fatura lida com sucesso!*\n\n`;
+    msg += `🏦 ${fatura.card_name}\n`;
+    msg += `📅 ${fatura.invoice_month}${fatura.due_date ? ` | Vence: ${fmtDate(fatura.due_date)}` : ""}\n`;
+    msg += `📊 *${fatura.items.length} lançamentos — ${fmt(total)}*\n\n`;
+    msg += `📋 *Por entidade:*\n`;
+    Object.entries(porEntidade).sort(([,a],[,b]) => b-a).forEach(([e, v]) => {
+      msg += `  • ${e}: ${fmt(v)}\n`;
+    });
+    msg += `\n🔗 Acesse o painel para revisar e confirmar:\n`;
+    msg += `*https://whisp-flow-ledger.lovable.app/cartoes/revisar*\n\n`;
+    msg += `Ou responda *confirmar* para lançar tudo agora, ou *cancelar* para descartar.`;
+
+    // Salvar itens temporariamente no banco para o painel conseguir exibir
+    const cardId = fatura.card_id || (cartoes.find(c =>
+      fatura.card_name?.toLowerCase().includes(c.name?.toLowerCase())
+    )?.id) || null;
+
+    if (cardId) {
+      // Salvar itens como pendentes no banco
+      const anoAtual = new Date().getFullYear();
+      const itensParaSalvar = fatura.items.map(item => {
+        // Converter data "DD/MM" para "YYYY-MM-DD"
+        let txDate = new Date().toISOString().split("T")[0];
+        if (item.date && item.date.includes("/")) {
+          const [dd, mm] = item.date.split("/");
+          txDate = `${anoAtual}-${mm.padStart(2,"0")}-${dd.padStart(2,"0")}`;
+        }
+        return {
+          card_id: cardId,
+          description: item.description,
+          value: item.amount,
+          transaction_date: txDate,
+          entity_id: ENTITY_MAP[item.entity] || ENTITY_MAP["Paulo"],
+          person_type: item.is_pf ? "PF" : "PJ",
+          invoice_month: fatura.due_date || new Date().toISOString().split("T")[0],
+          status: "pendente_revisao",
+        };
+      });
+      await dbInsert("card_invoice_items", itensParaSalvar);
+      session.cardId = cardId;
+      pendingSessions.set(from, session);
+    }
+
+    await sendMessage(from, msg);
+
+  } catch (err) {
+    console.error("Erro fatura cartão:", err.message);
+    await sendMessage(from, `🤖 *${BOT_NAME}:* ⚠️ Erro ao processar a fatura. Tente novamente ou descreva por texto.`);
+  }
+}
+
+// Confirmar lançamento da fatura
+async function confirmarFatura(from, usuario, session) {
+  pendingSessions.delete(from);
+  const { fatura, cardId } = session;
+  const items = session.itemsConfirmados.filter(i => i.confirmado);
+
+  let confirmados = 0;
+  for (const item of items) {
+    const entityId = ENTITY_MAP[item.entity] || ENTITY_MAP["Paulo"];
+    await dbInsert("transactions", {
+      type: "despesa",
+      entity_id: entityId,
+      description: item.description,
+      value: item.amount || item.value,
+      nature: item.is_pf ? "variavel" : "fixo",
+      status: "confirmado",
+      source: "whatsapp",
+      payment_method: "cartao",
+      created_by: WA_USER_PROFILE_ID,
+    });
+    confirmados++;
+  }
+
+  // Marcar itens como confirmados no card_invoice_items
+  if (cardId) {
+    await dbUpdate("card_invoice_items", `?card_id=eq.${cardId}&status=eq.pendente_revisao`, {
+      status: "confirmado"
+    });
+  }
+
+  const total = items.reduce((s, i) => s + Number(i.amount || i.value || 0), 0);
+  await sendMessage(from, `🤖 *${BOT_NAME}:*\n\n✅ *Fatura lançada!*\n\n💳 ${fatura.card_name}\n📊 ${confirmados} lançamentos — ${fmt(total)}\n\nTudo registrado no painel.`);
+  await notificarGestores(usuario, { descricao: `Fatura ${fatura.card_name} ${fatura.invoice_month}`, valor: total, entidade: "Vários" }, `FAT-${Date.now()}`);
+}
+
 // ─── Webhook GET ──────────────────────────────────────────────
 app.get("/webhook", (req, res) => {
   const mode = req.query["hub.mode"];
@@ -414,6 +643,24 @@ async function tratarRespostaUsuario(from, usuario, session, text) {
     return;
   }
 
+  if (session.etapa === "REVISAR_FATURA") {
+    if (sim.includes(lower) || lower === "confirmar") {
+      await confirmarFatura(from, usuario, session);
+      return;
+    }
+    if (nao.some(w => lower === w) || lower === "cancelar") {
+      // Apagar itens pendentes do banco se existirem
+      if (session.cardId) {
+        await dbUpdate("card_invoice_items", `?card_id=eq.${session.cardId}&status=eq.pendente_revisao`, { status: "cancelado" });
+      }
+      pendingSessions.delete(from);
+      await sendMessage(from, `🤖 *${BOT_NAME}:* ❌ Fatura descartada.`);
+      return;
+    }
+    await sendMessage(from, `🤖 *${BOT_NAME}:* Responda *confirmar* para lançar a fatura ou *cancelar* para descartar.`);
+    return;
+  }
+
   if (session.etapa === "CATEGORIA_PF") {
     session.dados.categoria = text;
     session.dados.entidade = /marketing|publicidade|uniforme|clínica|insumo/.test(lower) ? "Conjunta" : "Família";
@@ -433,6 +680,15 @@ async function processarTexto(from, usuario, text) {
   const lower = text.toLowerCase();
 
   if (["ajuda","help","?","oi","olá","ola"].includes(lower)) { await sendHelpMessage(from, usuario); return; }
+  if (lower === "fatura" || lower === "cartão" || lower === "cartao") {
+    const session2 = { etapa: "AGUARDANDO_FATURA_PDF" };
+    pendingSessions.set(from, session2);
+    setTimeout(() => pendingSessions.delete(from), 600000);
+    await sendMessage(from, `🤖 *${BOT_NAME}:*
+
+💳 Pronto! Me envie o *PDF da fatura* do cartão que eu leio e lanço as despesas automaticamente.`);
+    return;
+  }
   if ((lower === "saldo" || lower === "resumo") && usuario.role === "GESTOR") { await sendResumoGestor(from); return; }
   if ((lower.includes("boleto") || lower.includes("vencem")) && usuario.role === "GESTOR") { await responderBoletos(from); return; }
 
@@ -443,6 +699,21 @@ async function processarTexto(from, usuario, text) {
 
 // ─── Processar mídia ──────────────────────────────────────────
 async function processarMidia(from, usuario, message, tipo) {
+  // PDF de fatura de cartão → fluxo especial
+  if (tipo === "document") {
+    const filename = (message.document?.filename || "").toLowerCase();
+    const mimeType2 = message.document?.mime_type || "";
+    const isFatura = mimeType2 === "application/pdf" && (
+      filename.includes("fatura") || filename.includes("invoice") ||
+      filename.includes("cartao") || filename.includes("extrato")
+    );
+    const session = pendingSessions.get(from);
+    if (isFatura || session?.etapa === "AGUARDANDO_FATURA_PDF") {
+      await processarFaturaCartao(from, usuario, message);
+      return;
+    }
+  }
+
   await sendMessage(from, `🤖 _${BOT_NAME} lendo documento..._`);
   try {
     const mediaId = message[tipo]?.id || message.document?.id;
@@ -785,12 +1056,12 @@ app.get("/api/bills", async (req, res) => {
 
 // ─── Health ───────────────────────────────────────────────────
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", version: "5.0", db: SUPABASE_URL, timestamp: new Date().toISOString() });
+  res.json({ status: "ok", version: "6.0", db: SUPABASE_URL, timestamp: new Date().toISOString() });
 });
 
 // ─── Start ────────────────────────────────────────────────────
 app.listen(3000, () => {
-  console.log("🚀 Gestor IA WhatsApp v5 rodando na porta 3000");
+  console.log("🚀 Gestor IA WhatsApp v6 rodando na porta 3000");
   console.log(`🤖 IA: ${ANTHROPIC_API_KEY ? "configurada ✅" : "NÃO configurada ❌"}`);
   console.log(`📱 WhatsApp Token: ${ACCESS_TOKEN ? "configurado ✅" : "NÃO configurado ❌"}`);
   console.log(`🗄️  Banco Lovable: ${SUPABASE_URL}`);
